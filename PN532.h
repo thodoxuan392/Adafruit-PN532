@@ -13,10 +13,12 @@
 #ifndef ADAFRUIT_PN532_H
 #define ADAFRUIT_PN532_H
 
-#include "Arduino.h"
 
-#include <Adafruit_I2CDevice.h>
-#include <Adafruit_SPIDevice.h>
+#include <stdbool.h>
+#include <stdint.h>
+
+#include <PN532/PN532Interface.h>
+
 
 #define PN532_PREAMBLE (0x00)   ///< Command sequence start, byte 1/3
 #define PN532_STARTCODE1 (0x00) ///< Command sequence start, byte 2/3
@@ -135,87 +137,69 @@
 #define PN532_GPIO_P34 (4)              ///< GPIO 34
 #define PN532_GPIO_P35 (5)              ///< GPIO 35
 
-/**
- * @brief Class for working with Adafruit PN532 NFC/RFID breakout boards.
- */
-class Adafruit_PN532 {
-public:
-  Adafruit_PN532(uint8_t clk, uint8_t miso, uint8_t mosi,
-                 uint8_t ss);                          // Software SPI
-  Adafruit_PN532(uint8_t ss, SPIClass *theSPI = &SPI); // Hardware SPI
-  Adafruit_PN532(uint8_t irq, uint8_t reset,
-                 TwoWire *theWire = &Wire);              // Hardware I2C
-  Adafruit_PN532(uint8_t reset, HardwareSerial *theSer); // Hardware UART
-  bool begin(void);
+#define PN532_PACKBUFFSIZE 64                ///< Packet buffer size in bytes
 
-  void reset(void);
-  void wakeup(void);
 
-  // Generic PN532 functions
-  bool SAMConfig(void);
-  uint32_t getFirmwareVersion(void);
-  bool sendCommandCheckAck(uint8_t *cmd, uint8_t cmdlen,
-                           uint16_t timeout = 100);
-  bool writeGPIO(uint8_t pinstate);
-  uint8_t readGPIO(void);
-  bool setPassiveActivationRetries(uint8_t maxRetries);
-
-  // ISO14443A functions
-  bool readPassiveTargetID(
-      uint8_t cardbaudrate, uint8_t *uid, uint8_t *uidLength,
-      uint16_t timeout = 0); // timeout 0 means no timeout - will block forever.
-  bool startPassiveTargetIDDetection(uint8_t cardbaudrate);
-  bool readDetectedPassiveTargetID(uint8_t *uid, uint8_t *uidLength);
-  bool inDataExchange(uint8_t *send, uint8_t sendLength, uint8_t *response,
-                      uint8_t *responseLength);
-  bool inListPassiveTarget();
-  uint8_t AsTarget();
-  uint8_t getDataTarget(uint8_t *cmd, uint8_t *cmdlen);
-  uint8_t setDataTarget(uint8_t *cmd, uint8_t cmdlen);
-
-  // Mifare Classic functions
-  bool mifareclassic_IsFirstBlock(uint32_t uiBlock);
-  bool mifareclassic_IsTrailerBlock(uint32_t uiBlock);
-  uint8_t mifareclassic_AuthenticateBlock(uint8_t *uid, uint8_t uidLen,
-                                          uint32_t blockNumber,
-                                          uint8_t keyNumber, uint8_t *keyData);
-  uint8_t mifareclassic_ReadDataBlock(uint8_t blockNumber, uint8_t *data);
-  uint8_t mifareclassic_WriteDataBlock(uint8_t blockNumber, uint8_t *data);
-  uint8_t mifareclassic_FormatNDEF(void);
-  uint8_t mifareclassic_WriteNDEFURI(uint8_t sectorNumber,
-                                     uint8_t uriIdentifier, const char *url);
-
-  // Mifare Ultralight functions
-  uint8_t mifareultralight_ReadPage(uint8_t page, uint8_t *buffer);
-  uint8_t mifareultralight_WritePage(uint8_t page, uint8_t *data);
-
-  // NTAG2xx functions
-  uint8_t ntag2xx_ReadPage(uint8_t page, uint8_t *buffer);
-  uint8_t ntag2xx_WritePage(uint8_t page, uint8_t *data);
-  uint8_t ntag2xx_WriteNDEFURI(uint8_t uriIdentifier, char *url,
-                               uint8_t dataLen);
-
-  // Help functions to display formatted text
-  static void PrintHex(const byte *data, const uint32_t numBytes);
-  static void PrintHexChar(const byte *pbtData, const uint32_t numBytes);
-
-private:
-  int8_t _irq = -1, _reset = -1, _cs = -1;
+typedef struct {
+  PN532Interface interface;
   int8_t _uid[7];      // ISO14443A uid
   int8_t _uidLen;      // uid len
   int8_t _key[6];      // Mifare Classic key
   int8_t _inListedTag; // Tg number of inlisted tag.
+  uint8_t pn532_packetbuffer[PN532_PACKBUFFSIZE];
+}PN532_Handle;
 
-  // Low level communication functions that handle both SPI and I2C.
-  void readdata(uint8_t *buff, uint8_t n);
-  void writecommand(uint8_t *cmd, uint8_t cmdlen);
-  bool isready();
-  bool waitready(uint16_t timeout);
-  bool readack();
 
-  Adafruit_SPIDevice *spi_dev = NULL;
-  Adafruit_I2CDevice *i2c_dev = NULL;
-  HardwareSerial *ser_dev = NULL;
-};
+bool PN532_begin(PN532_Handle * handle);
+
+void PN532_reset(PN532_Handle * handle);
+void PN532_wakeup(PN532_Handle * handle);
+
+// Generic PN532 functions
+bool PN532_SAMConfig(PN532_Handle * handle);
+uint32_t PN532_getFirmwareVersion(PN532_Handle * handle);
+bool PN532_sendCommandCheckAck(PN532_Handle * handle, uint8_t *cmd, uint8_t cmdlen,
+                          uint16_t timeout);
+bool PN532_writeGPIO(PN532_Handle * handle, uint8_t pinstate);
+uint8_t PN532_readGPIO(PN532_Handle * handle);
+bool PN532_setPassiveActivationRetries(PN532_Handle * handle, uint8_t maxRetries);
+
+// ISO14443A functions
+bool PN532_readPassiveTargetID(PN532_Handle * handle, 
+    uint8_t cardbaudrate, uint8_t *uid, uint8_t *uidLength,
+    uint16_t timeout); // timeout 0 means no timeout - will block forever.
+bool PN532_startPassiveTargetIDDetection(PN532_Handle * handle, uint8_t cardbaudrate);
+bool PN532_readDetectedPassiveTargetID(PN532_Handle * handle, uint8_t *uid, uint8_t *uidLength);
+bool PN532_inDataExchange(PN532_Handle * handle, uint8_t *send, uint8_t sendLength, uint8_t *response,
+                    uint8_t *responseLength);
+bool PN532_inListPassiveTarget(PN532_Handle * handle);
+uint8_t PN532_AsTarget(PN532_Handle * handle);
+uint8_t PN532_getDataTarget(PN532_Handle * handle, uint8_t *cmd, uint8_t *cmdlen);
+uint8_t PN532_setDataTarget(PN532_Handle * handle, uint8_t *cmd, uint8_t cmdlen);
+
+// Mifare Classic functions
+bool PN532_mifareclassic_IsFirstBlock(PN532_Handle * handle, uint32_t uiBlock);
+bool PN532_mifareclassic_IsTrailerBlock(PN532_Handle * handle, uint32_t uiBlock);
+uint8_t PN532_mifareclassic_AuthenticateBlock(PN532_Handle * handle, uint8_t *uid, uint8_t uidLen,
+                                        uint32_t blockNumber,
+                                        uint8_t keyNumber, uint8_t *keyData);
+uint8_t PN532_mifareclassic_ReadDataBlock(PN532_Handle * handle, uint8_t blockNumber, uint8_t *data);
+uint8_t PN532_mifareclassic_WriteDataBlock(PN532_Handle * handle, uint8_t blockNumber, uint8_t *data);
+uint8_t PN532_mifareclassic_FormatNDEF(PN532_Handle * handle);
+uint8_t PN532_mifareclassic_WriteNDEFURI(PN532_Handle * handle, uint8_t sectorNumber,
+                                    uint8_t uriIdentifier, const char *url);
+
+// Mifare Ultralight functions
+uint8_t PN532_mifareultralight_ReadPage(PN532_Handle * handle, uint8_t page, uint8_t *buffer);
+uint8_t PN532_mifareultralight_WritePage(PN532_Handle * handle, uint8_t page, uint8_t *data);
+
+// NTAG2xx functions
+uint8_t PN532_ntag2xx_ReadPage(PN532_Handle * handle, uint8_t page, uint8_t *buffer);
+uint8_t PN532_ntag2xx_WritePage(PN532_Handle * handle, uint8_t page, uint8_t *data);
+uint8_t PN532_ntag2xx_WriteNDEFURI(PN532_Handle * handle, uint8_t uriIdentifier, char *url,
+                              uint8_t dataLen);
+
+void PN532_PrintHex(const uint8_t *data, const uint32_t numBytes);
+void PN532_PrintHexChar(const uint8_t *pbtData, const uint32_t numBytes);
 
 #endif

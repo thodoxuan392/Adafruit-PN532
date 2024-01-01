@@ -57,11 +57,18 @@
 */
 /**************************************************************************/
 
-#include "Adafruit_PN532.h"
+#include "PN532/PN532.h"
+#include "PN532/PN532Debug.h"
 
-byte pn532ack[] = {0x00, 0x00, 0xFF,
+#include <stdbool.h>
+#include <stdint.h>
+#include <string.h>
+
+#include "main.h"
+
+static const uint8_t pn532ack[] = {0x00, 0x00, 0xFF,
                    0x00, 0xFF, 0x00}; ///< ACK message from PN532
-byte pn532response_firmwarevers[] = {
+static const uint8_t pn532response_firmwarevers[] = {
     0x00, 0x00, 0xFF,
     0x06, 0xFA, 0xD5}; ///< Expected firmware version message from PN532
 
@@ -71,74 +78,21 @@ byte pn532response_firmwarevers[] = {
 // #define PN532DEBUG
 // #define MIFAREDEBUG
 
-// If using Native Port on Arduino Zero or Due define as SerialUSB
-#define PN532DEBUGPRINT Serial ///< Fixed name for debug Serial instance
-//#define PN532DEBUGPRINT SerialUSB ///< Fixed name for debug Serial instance
 
-#define PN532_PACKBUFFSIZ 64                ///< Packet buffer size in bytes
-byte pn532_packetbuffer[PN532_PACKBUFFSIZ]; ///< Packet buffer used in various
-                                            ///< transactions
 
-/**************************************************************************/
-/*!
-    @brief  Instantiates a new PN532 class using software SPI.
 
-    @param  clk       SPI clock pin (SCK)
-    @param  miso      SPI MISO pin
-    @param  mosi      SPI MOSI pin
-    @param  ss        SPI chip select pin (CS/SSEL)
-*/
-/**************************************************************************/
-Adafruit_PN532::Adafruit_PN532(uint8_t clk, uint8_t miso, uint8_t mosi,
-                               uint8_t ss) {
-  _cs = ss;
-  spi_dev = new Adafruit_SPIDevice(ss, clk, miso, mosi, 1000000,
-                                   SPI_BITORDER_LSBFIRST, SPI_MODE0);
-}
 
-/**************************************************************************/
-/*!
-    @brief  Instantiates a new PN532 class using I2C.
 
-    @param  irq       Location of the IRQ pin
-    @param  reset     Location of the RSTPD_N pin
-    @param  theWire   pointer to I2C bus to use
-*/
-/**************************************************************************/
-Adafruit_PN532::Adafruit_PN532(uint8_t irq, uint8_t reset, TwoWire *theWire)
-    : _irq(irq), _reset(reset) {
-  pinMode(_irq, INPUT);
-  pinMode(_reset, OUTPUT);
-  i2c_dev = new Adafruit_I2CDevice(PN532_I2C_ADDRESS, theWire);
-}
 
-/**************************************************************************/
-/*!
-    @brief  Instantiates a new PN532 class using hardware SPI.
+// Help functions to display formatted text
 
-    @param  ss        SPI chip select pin (CS/SSEL)
-    @param  theSPI    pointer to the SPI bus to use
-*/
-/**************************************************************************/
-Adafruit_PN532::Adafruit_PN532(uint8_t ss, SPIClass *theSPI) {
-  _cs = ss;
-  spi_dev = new Adafruit_SPIDevice(ss, 1000000, SPI_BITORDER_LSBFIRST,
-                                   SPI_MODE0, theSPI);
-}
 
-/**************************************************************************/
-/*!
-    @brief  Instantiates a new PN532 class using hardware UART (HSU).
-
-    @param  reset     Location of the RSTPD_N pin
-    @param  theSer    pointer to HardWare Serial bus to use
-*/
-/**************************************************************************/
-Adafruit_PN532::Adafruit_PN532(uint8_t reset, HardwareSerial *theSer)
-    : _reset(reset) {
-  pinMode(_reset, OUTPUT);
-  ser_dev = theSer;
-}
+// Low level communication functions that handle both SPI and I2C.
+static void PN532_readdata(PN532_Handle* handle, uint8_t *buff, uint8_t n);
+static void PN532_writecommand(PN532_Handle* handle,uint8_t *cmd, uint8_t cmdlen);
+static bool PN532_isready(PN532_Handle* handle);
+static bool PN532_waitready(PN532_Handle* handle, uint16_t timeout);
+static bool PN532_readack(PN532_Handle* handle);
 
 /**************************************************************************/
 /*!
@@ -147,30 +101,9 @@ Adafruit_PN532::Adafruit_PN532(uint8_t reset, HardwareSerial *theSer)
     @returns  true if successful, otherwise false
 */
 /**************************************************************************/
-bool Adafruit_PN532::begin() {
-  if (spi_dev) {
-    // SPI initialization
-    if (!spi_dev->begin()) {
-      return false;
-    }
-  } else if (i2c_dev) {
-    // I2C initialization
-    // PN532 will fail address check since its asleep, so suppress
-    if (!i2c_dev->begin(false)) {
-      return false;
-    }
-  } else if (ser_dev) {
-    ser_dev->begin(115200);
-    // clear out anything in read buffer
-    while (ser_dev->available())
-      ser_dev->read();
-  } else {
-    // no interface specified
-    return false;
-  }
-  reset(); // HW reset - put in known state
-  delay(10);
-  wakeup(); // hey! wakeup!
+bool PN532_begin(PN532_Handle * handle) {
+  PN532_reset(handle); // HW reset - put in known state
+  PN532_wakeup(handle); // hey! wakeup!
   return true;
 }
 
@@ -179,14 +112,7 @@ bool Adafruit_PN532::begin() {
     @brief  Perform a hardware reset. Requires reset pin to have been provided.
 */
 /**************************************************************************/
-void Adafruit_PN532::reset(void) {
-  // see Datasheet p.209, Fig.48 for timings
-  if (_reset != -1) {
-    digitalWrite(_reset, LOW);
-    delay(1); // min 20ns
-    digitalWrite(_reset, HIGH);
-    delay(2); // max 2ms
-  }
+void PN532_reset(PN532_Handle * handle) {
 }
 
 /**************************************************************************/
@@ -194,22 +120,9 @@ void Adafruit_PN532::reset(void) {
     @brief  Wakeup from LowVbat mode into Normal Mode.
 */
 /**************************************************************************/
-void Adafruit_PN532::wakeup(void) {
-  // interface specific wakeups - each one is unique!
-  if (spi_dev) {
-    // hold CS low for 2ms
-    digitalWrite(_cs, LOW);
-    delay(2);
-  } else if (ser_dev) {
-    uint8_t w[3] = {0x55, 0x00, 0x00};
-    ser_dev->write(w, 3);
-    delay(2);
-  }
-
-  // PN532 will clock stretch I2C during SAMConfig as a "wakeup"
-
+void PN532_wakeup(PN532_Handle * handle) {
   // need to config SAM to stay in Normal Mode
-  SAMConfig();
+  PN532_SAMConfig(handle);
 }
 
 /**************************************************************************/
@@ -220,19 +133,19 @@ void Adafruit_PN532::wakeup(void) {
     @param  numBytes  Data length in bytes
 */
 /**************************************************************************/
-void Adafruit_PN532::PrintHex(const byte *data, const uint32_t numBytes) {
+void PN532_PrintHex(const uint8_t *data, const uint32_t numBytes) {
   uint32_t szPos;
   for (szPos = 0; szPos < numBytes; szPos++) {
-    PN532DEBUGPRINT.print(F("0x"));
+    DMSG_STR("0x");
     // Append leading 0 for small values
     if (data[szPos] <= 0xF)
-      PN532DEBUGPRINT.print(F("0"));
-    PN532DEBUGPRINT.print(data[szPos] & 0xff, HEX);
+      DMSG_STR("0x");
+    DMSG_HEX(data[szPos] & 0xff);
     if ((numBytes > 1) && (szPos != numBytes - 1)) {
-      PN532DEBUGPRINT.print(F(" "));
+      DMSG_STR(" ");
     }
   }
-  PN532DEBUGPRINT.println();
+  DMSG_STR("\r\n");
 }
 
 /**************************************************************************/
@@ -246,25 +159,25 @@ void Adafruit_PN532::PrintHex(const byte *data, const uint32_t numBytes) {
     @param  numBytes  Data length in bytes
 */
 /**************************************************************************/
-void Adafruit_PN532::PrintHexChar(const byte *data, const uint32_t numBytes) {
+void PN532_PrintHexChar(const uint8_t *data, const uint32_t numBytes) {
   uint32_t szPos;
   for (szPos = 0; szPos < numBytes; szPos++) {
     // Append leading 0 for small values
     if (data[szPos] <= 0xF)
-      PN532DEBUGPRINT.print(F("0"));
-    PN532DEBUGPRINT.print(data[szPos], HEX);
+    DMSG_STR("0x");
+    DMSG_HEX(data[szPos]);
     if ((numBytes > 1) && (szPos != numBytes - 1)) {
-      PN532DEBUGPRINT.print(F(" "));
+    DMSG_STR(" ");
     }
   }
-  PN532DEBUGPRINT.print(F("  "));
+  DMSG_STR("  ");
   for (szPos = 0; szPos < numBytes; szPos++) {
     if (data[szPos] <= 0x1F)
-      PN532DEBUGPRINT.print(F("."));
+    DMSG_STR(".");
     else
-      PN532DEBUGPRINT.print((char)data[szPos]);
+      DMSG_CHAR((char)data[szPos]);
   }
-  PN532DEBUGPRINT.println();
+  DMSG_STR("\r\n");
 }
 
 /**************************************************************************/
@@ -274,35 +187,35 @@ void Adafruit_PN532::PrintHexChar(const byte *data, const uint32_t numBytes) {
     @returns  The chip's firmware version and ID
 */
 /**************************************************************************/
-uint32_t Adafruit_PN532::getFirmwareVersion(void) {
+uint32_t PN532_getFirmwareVersion(PN532_Handle * handle) {
   uint32_t response;
 
-  pn532_packetbuffer[0] = PN532_COMMAND_GETFIRMWAREVERSION;
+  handle->pn532_packetbuffer[0] = PN532_COMMAND_GETFIRMWAREVERSION;
 
-  if (!sendCommandCheckAck(pn532_packetbuffer, 1)) {
+  if (!PN532_sendCommandCheckAck(handle, handle->pn532_packetbuffer, 1, 1000)) {
     return 0;
   }
 
   // read data packet
-  readdata(pn532_packetbuffer, 13);
+  PN532_readdata(handle, handle->pn532_packetbuffer, 13);
 
   // check some basic stuff
-  if (0 != memcmp((char *)pn532_packetbuffer,
+  if (0 != memcmp((char *)handle->pn532_packetbuffer,
                   (char *)pn532response_firmwarevers, 6)) {
 #ifdef PN532DEBUG
-    PN532DEBUGPRINT.println(F("Firmware doesn't match!"));
+    DMSG_STR("Firmware doesn't match!");
 #endif
     return 0;
   }
 
   int offset = 7;
-  response = pn532_packetbuffer[offset++];
+  response = handle->pn532_packetbuffer[offset++];
   response <<= 8;
-  response |= pn532_packetbuffer[offset++];
+  response |= handle->pn532_packetbuffer[offset++];
   response <<= 8;
-  response |= pn532_packetbuffer[offset++];
+  response |= handle->pn532_packetbuffer[offset++];
   response <<= 8;
-  response |= pn532_packetbuffer[offset++];
+  response |= handle->pn532_packetbuffer[offset++];
 
   return response;
 }
@@ -320,45 +233,36 @@ uint32_t Adafruit_PN532::getFirmwareVersion(void) {
 */
 /**************************************************************************/
 // default timeout of one second
-bool Adafruit_PN532::sendCommandCheckAck(uint8_t *cmd, uint8_t cmdlen,
+bool PN532_sendCommandCheckAck(PN532_Handle * handle, uint8_t *cmd, uint8_t cmdlen,
                                          uint16_t timeout) {
 
   // I2C works without using IRQ pin by polling for RDY byte
   // seems to work best with some delays between transactions
   uint8_t SLOWDOWN = 0;
-  if (i2c_dev)
-    SLOWDOWN = 1;
 
   // write the command
-  writecommand(cmd, cmdlen);
+  PN532_writecommand(handle, cmd, cmdlen);
 
-  // I2C TUNING
-  delay(SLOWDOWN);
 
   // Wait for chip to say its ready!
-  if (!waitready(timeout)) {
+  if (!PN532_waitready(handle,timeout)) {
     return false;
   }
 
 #ifdef PN532DEBUG
-  if (spi_dev == NULL) {
-    PN532DEBUGPRINT.println(F("IRQ received"));
-  }
+    DMSG_STR("IRQ received");
 #endif
 
   // read acknowledgement
-  if (!readack()) {
+  if (!PN532_readack(handle)) {
 #ifdef PN532DEBUG
-    PN532DEBUGPRINT.println(F("No ACK frame received!"));
+    DMSG_STR("No ACK frame received!");
 #endif
     return false;
   }
 
-  // I2C TUNING
-  delay(SLOWDOWN);
-
   // Wait for chip to say its ready!
-  if (!waitready(timeout)) {
+  if (!PN532_waitready(handle, timeout)) {
     return false;
   }
 
@@ -388,38 +292,38 @@ bool Adafruit_PN532::sendCommandCheckAck(uint8_t *cmd, uint8_t cmdlen,
     @return  1 if everything executed properly, 0 for an error
 */
 /**************************************************************************/
-bool Adafruit_PN532::writeGPIO(uint8_t pinstate) {
+bool PN532_writeGPIO(PN532_Handle * handle, uint8_t pinstate) {
   // uint8_t errorbit;
 
   // Make sure pinstate does not try to toggle P32 or P34
   pinstate |= (1 << PN532_GPIO_P32) | (1 << PN532_GPIO_P34);
 
   // Fill command buffer
-  pn532_packetbuffer[0] = PN532_COMMAND_WRITEGPIO;
-  pn532_packetbuffer[1] = PN532_GPIO_VALIDATIONBIT | pinstate; // P3 Pins
-  pn532_packetbuffer[2] = 0x00; // P7 GPIO Pins (not used ... taken by SPI)
+  handle->pn532_packetbuffer[0] = PN532_COMMAND_WRITEGPIO;
+  handle->pn532_packetbuffer[1] = PN532_GPIO_VALIDATIONBIT | pinstate; // P3 Pins
+  handle->pn532_packetbuffer[2] = 0x00; // P7 GPIO Pins (not used ... taken by SPI)
 
 #ifdef PN532DEBUG
-  PN532DEBUGPRINT.print(F("Writing P3 GPIO: "));
-  PN532DEBUGPRINT.println(pn532_packetbuffer[1], HEX);
+  DMSG_STR("Writing P3 GPIO: ");
+  DMSG_HEX(handle->pn532_packetbuffer[1]);
 #endif
 
   // Send the WRITEGPIO command (0x0E)
-  if (!sendCommandCheckAck(pn532_packetbuffer, 3))
+  if (!PN532_sendCommandCheckAck(handle, handle->pn532_packetbuffer, 3, 1000))
     return 0x0;
 
   // Read response packet (00 FF PLEN PLENCHECKSUM D5 CMD+1(0x0F) DATACHECKSUM
   // 00)
-  readdata(pn532_packetbuffer, 8);
+  PN532_readdata(handle, handle->pn532_packetbuffer, 8);
 
 #ifdef PN532DEBUG
-  PN532DEBUGPRINT.print(F("Received: "));
-  PrintHex(pn532_packetbuffer, 8);
-  PN532DEBUGPRINT.println();
+  DMSG_STR("Received: ");
+  PN532_PrintHex(handle->pn532_packetbuffer, 8);
+  DMSG_STR("\r\n");
 #endif
 
   int offset = 6;
-  return (pn532_packetbuffer[offset] == 0x0F);
+  return (handle->pn532_packetbuffer[offset] == 0x0F);
 }
 
 /**************************************************************************/
@@ -436,16 +340,16 @@ bool Adafruit_PN532::writeGPIO(uint8_t pinstate) {
              pinState[5]  = P35
 */
 /**************************************************************************/
-uint8_t Adafruit_PN532::readGPIO(void) {
-  pn532_packetbuffer[0] = PN532_COMMAND_READGPIO;
+uint8_t PN532_readGPIO(PN532_Handle * handle) {
+  handle->pn532_packetbuffer[0] = PN532_COMMAND_READGPIO;
 
   // Send the READGPIO command (0x0C)
-  if (!sendCommandCheckAck(pn532_packetbuffer, 1))
+  if (!PN532_sendCommandCheckAck(handle, handle->pn532_packetbuffer, 1, 1000))
     return 0x0;
 
   // Read response packet (00 FF PLEN PLENCHECKSUM D5 CMD+1(0x0D) P3 P7 IO1
   // DATACHECKSUM 00)
-  readdata(pn532_packetbuffer, 11);
+  PN532_readdata(handle, handle->pn532_packetbuffer, 11);
 
   /* READGPIO response should be in the following format:
 
@@ -460,30 +364,30 @@ uint8_t Adafruit_PN532::readGPIO(void) {
   int p3offset = 7;
 
 #ifdef PN532DEBUG
-  PN532DEBUGPRINT.print(F("Received: "));
-  PrintHex(pn532_packetbuffer, 11);
-  PN532DEBUGPRINT.println();
-  PN532DEBUGPRINT.print(F("P3 GPIO: 0x"));
-  PN532DEBUGPRINT.println(pn532_packetbuffer[p3offset], HEX);
-  PN532DEBUGPRINT.print(F("P7 GPIO: 0x"));
-  PN532DEBUGPRINT.println(pn532_packetbuffer[p3offset + 1], HEX);
-  PN532DEBUGPRINT.print(F("IO GPIO: 0x"));
-  PN532DEBUGPRINT.println(pn532_packetbuffer[p3offset + 2], HEX);
+  DMSG_STR("Received: ");
+  PN532_PrintHex(handle->pn532_packetbuffer, 11);
+  DMSG_STR("\r\n");
+  DMSG_STR("P3 GPIO: 0x");
+  DMSG_HEX(handle->pn532_packetbuffer[p3offset]);
+  DMSG_STR("P7 GPIO: 0x");
+  DMSG_HEX(handle->pn532_packetbuffer[p3offset + 1]);
+  DMSG_STR("IO GPIO: 0x");
+  DMSG_HEX(handle->pn532_packetbuffer[p3offset + 2]);
   // Note: You can use the IO GPIO value to detect the serial bus being used
-  switch (pn532_packetbuffer[p3offset + 2]) {
+  switch (handle->pn532_packetbuffer[p3offset + 2]) {
   case 0x00: // Using UART
-    PN532DEBUGPRINT.println(F("Using UART (IO = 0x00)"));
+    DMSG_STR("Using UART (IO = 0x00)");
     break;
   case 0x01: // Using I2C
-    PN532DEBUGPRINT.println(F("Using I2C (IO = 0x01)"));
+    DMSG_STR("Using I2C (IO = 0x01)");
     break;
   case 0x02: // Using SPI
-    PN532DEBUGPRINT.println(F("Using SPI (IO = 0x02)"));
+    DMSG_STR("Using SPI (IO = 0x02)");
     break;
   }
 #endif
 
-  return pn532_packetbuffer[p3offset];
+  return handle->pn532_packetbuffer[p3offset];
 }
 
 /**************************************************************************/
@@ -492,20 +396,20 @@ uint8_t Adafruit_PN532::readGPIO(void) {
     @return  true on success, false otherwise.
 */
 /**************************************************************************/
-bool Adafruit_PN532::SAMConfig(void) {
-  pn532_packetbuffer[0] = PN532_COMMAND_SAMCONFIGURATION;
-  pn532_packetbuffer[1] = 0x01; // normal mode;
-  pn532_packetbuffer[2] = 0x14; // timeout 50ms * 20 = 1 second
-  pn532_packetbuffer[3] = 0x01; // use IRQ pin!
+bool PN532_SAMConfig(PN532_Handle * handle) {
+  handle->pn532_packetbuffer[0] = PN532_COMMAND_SAMCONFIGURATION;
+  handle->pn532_packetbuffer[1] = 0x01; // normal mode;
+  handle->pn532_packetbuffer[2] = 0x14; // timeout 50ms * 20 = 1 second
+  handle->pn532_packetbuffer[3] = 0x01; // use IRQ pin!
 
-  if (!sendCommandCheckAck(pn532_packetbuffer, 4))
+  if (!PN532_sendCommandCheckAck(handle, handle->pn532_packetbuffer, 4, 1000))
     return false;
 
   // read data packet
-  readdata(pn532_packetbuffer, 9);
+  PN532_readdata(handle, handle->pn532_packetbuffer, 9);
 
   int offset = 6;
-  return (pn532_packetbuffer[offset] == 0x15);
+  return (handle->pn532_packetbuffer[offset] == 0x15);
 }
 
 /**************************************************************************/
@@ -518,20 +422,20 @@ bool Adafruit_PN532::SAMConfig(void) {
     @returns 1 if everything executed properly, 0 for an error
 */
 /**************************************************************************/
-bool Adafruit_PN532::setPassiveActivationRetries(uint8_t maxRetries) {
-  pn532_packetbuffer[0] = PN532_COMMAND_RFCONFIGURATION;
-  pn532_packetbuffer[1] = 5;    // Config item 5 (MaxRetries)
-  pn532_packetbuffer[2] = 0xFF; // MxRtyATR (default = 0xFF)
-  pn532_packetbuffer[3] = 0x01; // MxRtyPSL (default = 0x01)
-  pn532_packetbuffer[4] = maxRetries;
+bool PN532_setPassiveActivationRetries(PN532_Handle * handle, uint8_t maxRetries) {
+  handle->pn532_packetbuffer[0] = PN532_COMMAND_RFCONFIGURATION;
+  handle->pn532_packetbuffer[1] = 5;    // Config item 5 (MaxRetries)
+  handle->pn532_packetbuffer[2] = 0xFF; // MxRtyATR (default = 0xFF)
+  handle->pn532_packetbuffer[3] = 0x01; // MxRtyPSL (default = 0x01)
+  handle->pn532_packetbuffer[4] = maxRetries;
 
 #ifdef MIFAREDEBUG
-  PN532DEBUGPRINT.print(F("Setting MxRtyPassiveActivation to "));
-  PN532DEBUGPRINT.print(maxRetries, DEC);
-  PN532DEBUGPRINT.println(F(" "));
+  DMSG_STR("Setting MxRtyPassiveActivation to ");
+  DMSG_INT(maxRetries);
+  DMSG_STR(" ");
 #endif
 
-  if (!sendCommandCheckAck(pn532_packetbuffer, 5))
+  if (!PN532_sendCommandCheckAck(handle, handle->pn532_packetbuffer, 5, 1000))
     return 0x0; // no ACK
 
   return 1;
@@ -554,20 +458,20 @@ bool Adafruit_PN532::setPassiveActivationRetries(uint8_t maxRetries) {
     @return  1 if everything executed properly, 0 for an error
 */
 /**************************************************************************/
-bool Adafruit_PN532::readPassiveTargetID(uint8_t cardbaudrate, uint8_t *uid,
+bool PN532_readPassiveTargetID(PN532_Handle * handle, uint8_t cardbaudrate, uint8_t *uid,
                                          uint8_t *uidLength, uint16_t timeout) {
-  pn532_packetbuffer[0] = PN532_COMMAND_INLISTPASSIVETARGET;
-  pn532_packetbuffer[1] = 1; // max 1 cards at once (we can set this to 2 later)
-  pn532_packetbuffer[2] = cardbaudrate;
+  handle->pn532_packetbuffer[0] = PN532_COMMAND_INLISTPASSIVETARGET;
+  handle->pn532_packetbuffer[1] = 1; // max 1 cards at once (we can set this to 2 later)
+  handle->pn532_packetbuffer[2] = cardbaudrate;
 
-  if (!sendCommandCheckAck(pn532_packetbuffer, 3, timeout)) {
+  if (!PN532_sendCommandCheckAck(handle, handle->pn532_packetbuffer, 3, timeout)) {
 #ifdef PN532DEBUG
-    PN532DEBUGPRINT.println(F("No card(s) read"));
+    DMSG_STR("No card(s) read");
 #endif
     return 0x0; // no cards read
   }
 
-  return readDetectedPassiveTargetID(uid, uidLength);
+  return PN532_readDetectedPassiveTargetID(handle, uid, uidLength);
 }
 
 /**************************************************************************/
@@ -578,12 +482,12 @@ bool Adafruit_PN532::readPassiveTargetID(uint8_t cardbaudrate, uint8_t *uid,
     @return  1 if everything executed properly, 0 for an error
 */
 /**************************************************************************/
-bool Adafruit_PN532::startPassiveTargetIDDetection(uint8_t cardbaudrate) {
-  pn532_packetbuffer[0] = PN532_COMMAND_INLISTPASSIVETARGET;
-  pn532_packetbuffer[1] = 1; // max 1 cards at once (we can set this to 2 later)
-  pn532_packetbuffer[2] = cardbaudrate;
+bool PN532_startPassiveTargetIDDetection(PN532_Handle * handle, uint8_t cardbaudrate) {
+  handle->pn532_packetbuffer[0] = PN532_COMMAND_INLISTPASSIVETARGET;
+  handle->pn532_packetbuffer[1] = 1; // max 1 cards at once (we can set this to 2 later)
+  handle->pn532_packetbuffer[2] = cardbaudrate;
 
-  return sendCommandCheckAck(pn532_packetbuffer, 3);
+  return PN532_sendCommandCheckAck(handle, handle->pn532_packetbuffer, 3, 1000);
 }
 
 /**************************************************************************/
@@ -598,10 +502,10 @@ bool Adafruit_PN532::startPassiveTargetIDDetection(uint8_t cardbaudrate) {
     @returns 1 if everything executed properly, 0 for an error
 */
 /**************************************************************************/
-bool Adafruit_PN532::readDetectedPassiveTargetID(uint8_t *uid,
+bool PN532_readDetectedPassiveTargetID(PN532_Handle * handle, uint8_t *uid,
                                                  uint8_t *uidLength) {
   // read data packet
-  readdata(pn532_packetbuffer, 20);
+  PN532_readdata(handle, handle->pn532_packetbuffer, 20);
   // check some basic stuff
 
   /* ISO14443A card response should be in the following format:
@@ -617,37 +521,37 @@ bool Adafruit_PN532::readDetectedPassiveTargetID(uint8_t *uid,
     b13..NFCIDLen   NFCID                                      */
 
 #ifdef MIFAREDEBUG
-  PN532DEBUGPRINT.print(F("Found "));
-  PN532DEBUGPRINT.print(pn532_packetbuffer[7], DEC);
-  PN532DEBUGPRINT.println(F(" tags"));
+  DMSG_STR("Found ");
+  DMSG_INT(handle->pn532_packetbuffer[7]);
+  DMSG_STR(" tags");
 #endif
-  if (pn532_packetbuffer[7] != 1)
+  if (handle->pn532_packetbuffer[7] != 1)
     return 0;
 
-  uint16_t sens_res = pn532_packetbuffer[9];
+  uint16_t sens_res = handle->pn532_packetbuffer[9];
   sens_res <<= 8;
-  sens_res |= pn532_packetbuffer[10];
+  sens_res |= handle->pn532_packetbuffer[10];
 #ifdef MIFAREDEBUG
-  PN532DEBUGPRINT.print(F("ATQA: 0x"));
-  PN532DEBUGPRINT.println(sens_res, HEX);
-  PN532DEBUGPRINT.print(F("SAK: 0x"));
-  PN532DEBUGPRINT.println(pn532_packetbuffer[11], HEX);
+  DMSG_STR("ATQA: 0x");
+  DMSG_HEX(sens_res);
+  DMSG_STR("SAK: 0x");
+  DMSG_HEX(handle->pn532_packetbuffer[11]);
 #endif
 
   /* Card appears to be Mifare Classic */
-  *uidLength = pn532_packetbuffer[12];
+  *uidLength = handle->pn532_packetbuffer[12];
 #ifdef MIFAREDEBUG
-  PN532DEBUGPRINT.print(F("UID:"));
+  DMSG_STR("UID:");
 #endif
-  for (uint8_t i = 0; i < pn532_packetbuffer[12]; i++) {
-    uid[i] = pn532_packetbuffer[13 + i];
+  for (uint8_t i = 0; i < handle->pn532_packetbuffer[12]; i++) {
+    uid[i] = handle->pn532_packetbuffer[13 + i];
 #ifdef MIFAREDEBUG
-    PN532DEBUGPRINT.print(F(" 0x"));
-    PN532DEBUGPRINT.print(uid[i], HEX);
+    DMSG_STR(" 0x");
+    DMSG_HEX(uid[i]);
 #endif
   }
 #ifdef MIFAREDEBUG
-  PN532DEBUGPRINT.println();
+  DMSG_STR("\r\n");
 #endif
 
   return 1;
@@ -664,55 +568,55 @@ bool Adafruit_PN532::readDetectedPassiveTargetID(uint8_t *uid,
     @return  true on success, false otherwise.
 */
 /**************************************************************************/
-bool Adafruit_PN532::inDataExchange(uint8_t *send, uint8_t sendLength,
+bool PN532_inDataExchange(PN532_Handle * handle, uint8_t *send, uint8_t sendLength,
                                     uint8_t *response,
                                     uint8_t *responseLength) {
-  if (sendLength > PN532_PACKBUFFSIZ - 2) {
+  if (sendLength > PN532_PACKBUFFSIZE - 2) {
 #ifdef PN532DEBUG
-    PN532DEBUGPRINT.println(F("APDU length too long for packet buffer"));
+    DMSG_STR("APDU length too long for packet buffer");
 #endif
     return false;
   }
   uint8_t i;
 
-  pn532_packetbuffer[0] = 0x40; // PN532_COMMAND_INDATAEXCHANGE;
-  pn532_packetbuffer[1] = _inListedTag;
+  handle->pn532_packetbuffer[0] = 0x40; // PN532_COMMAND_INDATAEXCHANGE;
+  handle->pn532_packetbuffer[1] = handle->_inListedTag;
   for (i = 0; i < sendLength; ++i) {
-    pn532_packetbuffer[i + 2] = send[i];
+    handle->pn532_packetbuffer[i + 2] = send[i];
   }
 
-  if (!sendCommandCheckAck(pn532_packetbuffer, sendLength + 2, 1000)) {
+  if (!PN532_sendCommandCheckAck(handle, handle->pn532_packetbuffer, sendLength + 2, 1000)) {
 #ifdef PN532DEBUG
-    PN532DEBUGPRINT.println(F("Could not send APDU"));
+    DMSG_STR("Could not send APDU");
 #endif
     return false;
   }
 
-  if (!waitready(1000)) {
+  if (!PN532_waitready(handle, 1000)) {
 #ifdef PN532DEBUG
-    PN532DEBUGPRINT.println(F("Response never received for APDU..."));
+    DMSG_STR("Response never received for APDU...");
 #endif
     return false;
   }
 
-  readdata(pn532_packetbuffer, sizeof(pn532_packetbuffer));
+  PN532_readdata(handle, handle->pn532_packetbuffer, sizeof(handle->pn532_packetbuffer));
 
-  if (pn532_packetbuffer[0] == 0 && pn532_packetbuffer[1] == 0 &&
-      pn532_packetbuffer[2] == 0xff) {
-    uint8_t length = pn532_packetbuffer[3];
-    if (pn532_packetbuffer[4] != (uint8_t)(~length + 1)) {
+  if (handle->pn532_packetbuffer[0] == 0 && handle->pn532_packetbuffer[1] == 0 &&
+      handle->pn532_packetbuffer[2] == 0xff) {
+    uint8_t length = handle->pn532_packetbuffer[3];
+    if (handle->pn532_packetbuffer[4] != (uint8_t)(~length + 1)) {
 #ifdef PN532DEBUG
-      PN532DEBUGPRINT.println(F("Length check invalid"));
-      PN532DEBUGPRINT.println(length, HEX);
-      PN532DEBUGPRINT.println((~length) + 1, HEX);
+      DMSG_STR("Length check invalid");
+      DMSG_HEX(length);
+      DMSG_HEX((~length) + 1);
 #endif
       return false;
     }
-    if (pn532_packetbuffer[5] == PN532_PN532TOHOST &&
-        pn532_packetbuffer[6] == PN532_RESPONSE_INDATAEXCHANGE) {
-      if ((pn532_packetbuffer[7] & 0x3f) != 0) {
+    if (handle->pn532_packetbuffer[5] == PN532_PN532TOHOST &&
+        handle->pn532_packetbuffer[6] == PN532_RESPONSE_INDATAEXCHANGE) {
+      if ((handle->pn532_packetbuffer[7] & 0x3f) != 0) {
 #ifdef PN532DEBUG
-        PN532DEBUGPRINT.println(F("Status code indicates an error"));
+        DMSG_STR("Status code indicates an error");
 #endif
         return false;
       }
@@ -724,18 +628,18 @@ bool Adafruit_PN532::inDataExchange(uint8_t *send, uint8_t sendLength,
       }
 
       for (i = 0; i < length; ++i) {
-        response[i] = pn532_packetbuffer[8 + i];
+        response[i] = handle->pn532_packetbuffer[8 + i];
       }
       *responseLength = length;
 
       return true;
     } else {
-      PN532DEBUGPRINT.print(F("Don't know how to handle this command: "));
-      PN532DEBUGPRINT.println(pn532_packetbuffer[6], HEX);
+      DMSG_STR("Don't know how to handle this command: ");
+      DMSG_HEX(handle->pn532_packetbuffer[6]);
       return false;
     }
   } else {
-    PN532DEBUGPRINT.println(F("Preamble missing"));
+    DMSG_STR("Preamble missing");
     return false;
   }
 }
@@ -747,64 +651,64 @@ bool Adafruit_PN532::inDataExchange(uint8_t *send, uint8_t sendLength,
     @return  true on success, false otherwise.
 */
 /**************************************************************************/
-bool Adafruit_PN532::inListPassiveTarget() {
-  pn532_packetbuffer[0] = PN532_COMMAND_INLISTPASSIVETARGET;
-  pn532_packetbuffer[1] = 1;
-  pn532_packetbuffer[2] = 0;
+bool PN532_inListPassiveTarget(PN532_Handle * handle) {
+  handle->pn532_packetbuffer[0] = PN532_COMMAND_INLISTPASSIVETARGET;
+  handle->pn532_packetbuffer[1] = 1;
+  handle->pn532_packetbuffer[2] = 0;
 
 #ifdef PN532DEBUG
-  PN532DEBUGPRINT.print(F("About to inList passive target"));
+  DMSG_STR("About to inList passive target");
 #endif
 
-  if (!sendCommandCheckAck(pn532_packetbuffer, 3, 1000)) {
+  if (!PN532_sendCommandCheckAck(handle, handle->pn532_packetbuffer, 3, 1000)) {
 #ifdef PN532DEBUG
-    PN532DEBUGPRINT.println(F("Could not send inlist message"));
+    DMSG_STR("Could not send inlist message");
 #endif
     return false;
   }
 
-  if (!waitready(30000)) {
+  if (!PN532_waitready(handle, 30000)) {
     return false;
   }
 
-  readdata(pn532_packetbuffer, sizeof(pn532_packetbuffer));
+  PN532_readdata(handle, handle->pn532_packetbuffer, sizeof(handle->pn532_packetbuffer));
 
-  if (pn532_packetbuffer[0] == 0 && pn532_packetbuffer[1] == 0 &&
-      pn532_packetbuffer[2] == 0xff) {
-    uint8_t length = pn532_packetbuffer[3];
-    if (pn532_packetbuffer[4] != (uint8_t)(~length + 1)) {
+  if (handle->pn532_packetbuffer[0] == 0 && handle->pn532_packetbuffer[1] == 0 &&
+      handle->pn532_packetbuffer[2] == 0xff) {
+    uint8_t length = handle->pn532_packetbuffer[3];
+    if (handle->pn532_packetbuffer[4] != (uint8_t)(~length + 1)) {
 #ifdef PN532DEBUG
-      PN532DEBUGPRINT.println(F("Length check invalid"));
-      PN532DEBUGPRINT.println(length, HEX);
-      PN532DEBUGPRINT.println((~length) + 1, HEX);
+      DMSG_STR("Length check invalid");
+      DMSG_HEX(length);
+      DMSG_HEX((~length) + 1);
 #endif
       return false;
     }
-    if (pn532_packetbuffer[5] == PN532_PN532TOHOST &&
-        pn532_packetbuffer[6] == PN532_RESPONSE_INLISTPASSIVETARGET) {
-      if (pn532_packetbuffer[7] != 1) {
+    if (handle->pn532_packetbuffer[5] == PN532_PN532TOHOST &&
+        handle->pn532_packetbuffer[6] == PN532_RESPONSE_INLISTPASSIVETARGET) {
+      if (handle->pn532_packetbuffer[7] != 1) {
 #ifdef PN532DEBUG
-        PN532DEBUGPRINT.println(F("Unhandled number of targets inlisted"));
+        DMSG_STR("Unhandled number of targets inlisted");
 #endif
-        PN532DEBUGPRINT.println(F("Number of tags inlisted:"));
-        PN532DEBUGPRINT.println(pn532_packetbuffer[7]);
+        DMSG_STR("Number of tags inlisted:");
+        DMSG_INT(handle->pn532_packetbuffer[7]);
         return false;
       }
 
-      _inListedTag = pn532_packetbuffer[8];
-      PN532DEBUGPRINT.print(F("Tag number: "));
-      PN532DEBUGPRINT.println(_inListedTag);
+      handle->_inListedTag = handle->pn532_packetbuffer[8];
+      DMSG_STR("Tag number: ");
+      DMSG_INT(handle->_inListedTag);
 
       return true;
     } else {
 #ifdef PN532DEBUG
-      PN532DEBUGPRINT.print(F("Unexpected response to inlist passive host"));
+      DMSG_STR("Unexpected response to inlist passive host");
 #endif
       return false;
     }
   } else {
 #ifdef PN532DEBUG
-    PN532DEBUGPRINT.println(F("Preamble missing"));
+    DMSG_STR("Preamble missing");
 #endif
     return false;
   }
@@ -822,7 +726,7 @@ bool Adafruit_PN532::inListPassiveTarget() {
     @return  true if first block, false otherwise.
 */
 /**************************************************************************/
-bool Adafruit_PN532::mifareclassic_IsFirstBlock(uint32_t uiBlock) {
+bool PN532_mifareclassic_IsFirstBlock(PN532_Handle * handle, uint32_t uiBlock) {
   // Test if we are in the small or big sectors
   if (uiBlock < 128)
     return ((uiBlock) % 4 == 0);
@@ -838,7 +742,7 @@ bool Adafruit_PN532::mifareclassic_IsFirstBlock(uint32_t uiBlock) {
     @return  true if sector trailer, false otherwise.
 */
 /**************************************************************************/
-bool Adafruit_PN532::mifareclassic_IsTrailerBlock(uint32_t uiBlock) {
+bool PN532_mifareclassic_IsTrailerBlock(PN532_Handle * handle, uint32_t uiBlock) {
   // Test if we are in the small or big sectors
   if (uiBlock < 128)
     return ((uiBlock + 1) % 4 == 0);
@@ -865,7 +769,7 @@ bool Adafruit_PN532::mifareclassic_IsTrailerBlock(uint32_t uiBlock) {
     @returns 1 if everything executed properly, 0 for an error
 */
 /**************************************************************************/
-uint8_t Adafruit_PN532::mifareclassic_AuthenticateBlock(uint8_t *uid,
+uint8_t PN532_mifareclassic_AuthenticateBlock(PN532_Handle * handle, uint8_t *uid,
                                                         uint8_t uidLen,
                                                         uint32_t blockNumber,
                                                         uint8_t keyNumber,
@@ -874,45 +778,45 @@ uint8_t Adafruit_PN532::mifareclassic_AuthenticateBlock(uint8_t *uid,
   uint8_t i;
 
   // Hang on to the key and uid data
-  memcpy(_key, keyData, 6);
-  memcpy(_uid, uid, uidLen);
-  _uidLen = uidLen;
+  memcpy(handle->_key, keyData, 6);
+  memcpy(handle->_uid, uid, uidLen);
+  handle->_uidLen = uidLen;
 
 #ifdef MIFAREDEBUG
-  PN532DEBUGPRINT.print(F("Trying to authenticate card "));
-  Adafruit_PN532::PrintHex(_uid, _uidLen);
-  PN532DEBUGPRINT.print(F("Using authentication KEY "));
-  PN532DEBUGPRINT.print(keyNumber ? 'B' : 'A');
-  PN532DEBUGPRINT.print(F(": "));
-  Adafruit_PN532::PrintHex(_key, 6);
+  DMSG_STR("Trying to authenticate card ");
+  PrintHex(_uid, _uidLen);
+  DMSG_STR("Using authentication KEY ");
+  DMSG_INT(keyNumber ? 'B' : 'A');
+  DMSG_STR(": "));
+  PrintHex(_key, 6);
 #endif
 
   // Prepare the authentication command //
-  pn532_packetbuffer[0] =
+  handle->pn532_packetbuffer[0] =
       PN532_COMMAND_INDATAEXCHANGE; /* Data Exchange Header */
-  pn532_packetbuffer[1] = 1;        /* Max card numbers */
-  pn532_packetbuffer[2] = (keyNumber) ? MIFARE_CMD_AUTH_B : MIFARE_CMD_AUTH_A;
-  pn532_packetbuffer[3] =
+  handle->pn532_packetbuffer[1] = 1;        /* Max card numbers */
+  handle->pn532_packetbuffer[2] = (keyNumber) ? MIFARE_CMD_AUTH_B : MIFARE_CMD_AUTH_A;
+  handle->pn532_packetbuffer[3] =
       blockNumber; /* Block Number (1K = 0..63, 4K = 0..255 */
-  memcpy(pn532_packetbuffer + 4, _key, 6);
-  for (i = 0; i < _uidLen; i++) {
-    pn532_packetbuffer[10 + i] = _uid[i]; /* 4 byte card ID */
+  memcpy(handle->pn532_packetbuffer + 4, handle->_key, 6);
+  for (i = 0; i < handle->_uidLen; i++) {
+    handle->pn532_packetbuffer[10 + i] = handle->_uid[i]; /* 4 byte card ID */
   }
 
-  if (!sendCommandCheckAck(pn532_packetbuffer, 10 + _uidLen))
+  if (!PN532_sendCommandCheckAck(handle, handle->pn532_packetbuffer, 10 + handle->_uidLen, 1000))
     return 0;
 
   // Read the response packet
-  readdata(pn532_packetbuffer, 12);
+  PN532_readdata(handle, handle->pn532_packetbuffer, 12);
 
   // check if the response is valid and we are authenticated???
   // for an auth success it should be bytes 5-7: 0xD5 0x41 0x00
   // Mifare auth error is technically byte 7: 0x14 but anything other and 0x00
   // is not good
-  if (pn532_packetbuffer[7] != 0x00) {
+  if (handle->pn532_packetbuffer[7] != 0x00) {
 #ifdef PN532DEBUG
-    PN532DEBUGPRINT.print(F("Authentification failed: "));
-    Adafruit_PN532::PrintHexChar(pn532_packetbuffer, 12);
+    DMSG_STR("Authentification failed: ");
+    PN532_PrintHexChar(handle->pn532_packetbuffer, 12);
 #endif
     return 0;
   }
@@ -933,49 +837,49 @@ uint8_t Adafruit_PN532::mifareclassic_AuthenticateBlock(uint8_t *uid,
     @returns 1 if everything executed properly, 0 for an error
 */
 /**************************************************************************/
-uint8_t Adafruit_PN532::mifareclassic_ReadDataBlock(uint8_t blockNumber,
+uint8_t PN532_mifareclassic_ReadDataBlock(PN532_Handle * handle, uint8_t blockNumber,
                                                     uint8_t *data) {
 #ifdef MIFAREDEBUG
-  PN532DEBUGPRINT.print(F("Trying to read 16 bytes from block "));
+  DMSG_STR("Trying to read 16 bytes from block "));
   PN532DEBUGPRINT.println(blockNumber);
 #endif
 
   /* Prepare the command */
-  pn532_packetbuffer[0] = PN532_COMMAND_INDATAEXCHANGE;
-  pn532_packetbuffer[1] = 1;               /* Card number */
-  pn532_packetbuffer[2] = MIFARE_CMD_READ; /* Mifare Read command = 0x30 */
-  pn532_packetbuffer[3] =
+  handle->pn532_packetbuffer[0] = PN532_COMMAND_INDATAEXCHANGE;
+  handle->pn532_packetbuffer[1] = 1;               /* Card number */
+  handle->pn532_packetbuffer[2] = MIFARE_CMD_READ; /* Mifare Read command = 0x30 */
+  handle->pn532_packetbuffer[3] =
       blockNumber; /* Block Number (0..63 for 1K, 0..255 for 4K) */
 
   /* Send the command */
-  if (!sendCommandCheckAck(pn532_packetbuffer, 4)) {
+  if (!PN532_sendCommandCheckAck(handle, handle->pn532_packetbuffer, 4, 1000)) {
 #ifdef MIFAREDEBUG
-    PN532DEBUGPRINT.println(F("Failed to receive ACK for read command"));
+    DMSG_STR("Failed to receive ACK for read command");
 #endif
     return 0;
   }
 
   /* Read the response packet */
-  readdata(pn532_packetbuffer, 26);
+  PN532_readdata(handle, handle->pn532_packetbuffer, 26);
 
   /* If byte 8 isn't 0x00 we probably have an error */
-  if (pn532_packetbuffer[7] != 0x00) {
+  if (handle->pn532_packetbuffer[7] != 0x00) {
 #ifdef MIFAREDEBUG
-    PN532DEBUGPRINT.println(F("Unexpected response"));
-    Adafruit_PN532::PrintHexChar(pn532_packetbuffer, 26);
+    DMSG_STR("Unexpected response");
+    PN532_PrintHexChar(handle->pn532_packetbuffer, 26);
 #endif
     return 0;
   }
 
   /* Copy the 16 data bytes to the output buffer        */
   /* Block content starts at byte 9 of a valid response */
-  memcpy(data, pn532_packetbuffer + 8, 16);
+  memcpy(data, handle->pn532_packetbuffer + 8, 16);
 
 /* Display data for debug if requested */
 #ifdef MIFAREDEBUG
-  PN532DEBUGPRINT.print(F("Block "));
-  PN532DEBUGPRINT.println(blockNumber);
-  Adafruit_PN532::PrintHexChar(data, 16);
+  DMSG_STR("Block ");
+  DMSG_INT(blockNumber);
+  PN532_PrintHexChar(data, 16);
 #endif
 
   return 1;
@@ -993,32 +897,32 @@ uint8_t Adafruit_PN532::mifareclassic_ReadDataBlock(uint8_t blockNumber,
     @returns 1 if everything executed properly, 0 for an error
 */
 /**************************************************************************/
-uint8_t Adafruit_PN532::mifareclassic_WriteDataBlock(uint8_t blockNumber,
+uint8_t PN532_mifareclassic_WriteDataBlock(PN532_Handle * handle, uint8_t blockNumber,
                                                      uint8_t *data) {
 #ifdef MIFAREDEBUG
-  PN532DEBUGPRINT.print(F("Trying to write 16 bytes to block "));
-  PN532DEBUGPRINT.println(blockNumber);
+  DMSG_STR("Trying to write 16 bytes to block ");
+  DMSG_INT(blockNumber);
 #endif
 
   /* Prepare the first command */
-  pn532_packetbuffer[0] = PN532_COMMAND_INDATAEXCHANGE;
-  pn532_packetbuffer[1] = 1;                /* Card number */
-  pn532_packetbuffer[2] = MIFARE_CMD_WRITE; /* Mifare Write command = 0xA0 */
-  pn532_packetbuffer[3] =
+  handle->pn532_packetbuffer[0] = PN532_COMMAND_INDATAEXCHANGE;
+  handle->pn532_packetbuffer[1] = 1;                /* Card number */
+  handle->pn532_packetbuffer[2] = MIFARE_CMD_WRITE; /* Mifare Write command = 0xA0 */
+  handle->pn532_packetbuffer[3] =
       blockNumber; /* Block Number (0..63 for 1K, 0..255 for 4K) */
-  memcpy(pn532_packetbuffer + 4, data, 16); /* Data Payload */
+  memcpy(handle->pn532_packetbuffer + 4, data, 16); /* Data Payload */
 
   /* Send the command */
-  if (!sendCommandCheckAck(pn532_packetbuffer, 20)) {
+  if (!PN532_sendCommandCheckAck(handle, handle->pn532_packetbuffer, 20, 1000)) {
 #ifdef MIFAREDEBUG
-    PN532DEBUGPRINT.println(F("Failed to receive ACK for write command"));
+    DMSG_STR("Failed to receive ACK for write command");
 #endif
     return 0;
   }
-  delay(10);
+  HAL_Delay(10);
 
   /* Read the response packet */
-  readdata(pn532_packetbuffer, 26);
+  PN532_readdata(handle, handle->pn532_packetbuffer, 26);
 
   return 1;
 }
@@ -1030,7 +934,7 @@ uint8_t Adafruit_PN532::mifareclassic_WriteDataBlock(uint8_t blockNumber,
     @returns 1 if everything executed properly, 0 for an error
 */
 /**************************************************************************/
-uint8_t Adafruit_PN532::mifareclassic_FormatNDEF(void) {
+uint8_t PN532_mifareclassic_FormatNDEF(PN532_Handle * handle) {
   uint8_t sectorbuffer1[16] = {0x14, 0x01, 0x03, 0xE1, 0x03, 0xE1, 0x03, 0xE1,
                                0x03, 0xE1, 0x03, 0xE1, 0x03, 0xE1, 0x03, 0xE1};
   uint8_t sectorbuffer2[16] = {0x03, 0xE1, 0x03, 0xE1, 0x03, 0xE1, 0x03, 0xE1,
@@ -1042,12 +946,12 @@ uint8_t Adafruit_PN532::mifareclassic_FormatNDEF(void) {
   // for the MAD sector in NDEF records (sector 0)
 
   // Write block 1 and 2 to the card
-  if (!(mifareclassic_WriteDataBlock(1, sectorbuffer1)))
+  if (!(PN532_mifareclassic_WriteDataBlock(handle, 1, sectorbuffer1)))
     return 0;
-  if (!(mifareclassic_WriteDataBlock(2, sectorbuffer2)))
+  if (!(PN532_mifareclassic_WriteDataBlock(handle, 2, sectorbuffer2)))
     return 0;
   // Write key A and access rights card
-  if (!(mifareclassic_WriteDataBlock(3, sectorbuffer3)))
+  if (!(PN532_mifareclassic_WriteDataBlock(handle, 3, sectorbuffer3)))
     return 0;
 
   // Seems that everything was OK (?!)
@@ -1072,7 +976,7 @@ uint8_t Adafruit_PN532::mifareclassic_FormatNDEF(void) {
     @returns 1 if everything executed properly, 0 for an error
 */
 /**************************************************************************/
-uint8_t Adafruit_PN532::mifareclassic_WriteNDEFURI(uint8_t sectorNumber,
+uint8_t PN532_mifareclassic_WriteNDEFURI(PN532_Handle * handle, uint8_t sectorNumber,
                                                    uint8_t uriIdentifier,
                                                    const char *url) {
   // Figure out how long the string is
@@ -1139,13 +1043,13 @@ uint8_t Adafruit_PN532::mifareclassic_WriteNDEFURI(uint8_t sectorNumber,
   }
 
   // Now write all three blocks back to the card
-  if (!(mifareclassic_WriteDataBlock(sectorNumber * 4, sectorbuffer1)))
+  if (!(PN532_mifareclassic_WriteDataBlock(handle, sectorNumber * 4, sectorbuffer1)))
     return 0;
-  if (!(mifareclassic_WriteDataBlock((sectorNumber * 4) + 1, sectorbuffer2)))
+  if (!(PN532_mifareclassic_WriteDataBlock(handle, (sectorNumber * 4) + 1, sectorbuffer2)))
     return 0;
-  if (!(mifareclassic_WriteDataBlock((sectorNumber * 4) + 2, sectorbuffer3)))
+  if (!(PN532_mifareclassic_WriteDataBlock(handle, (sectorNumber * 4) + 2, sectorbuffer3)))
     return 0;
-  if (!(mifareclassic_WriteDataBlock((sectorNumber * 4) + 3, sectorbuffer4)))
+  if (!(PN532_mifareclassic_WriteDataBlock(handle, (sectorNumber * 4) + 3, sectorbuffer4)))
     return 0;
 
   // Seems that everything was OK (?!)
@@ -1164,63 +1068,63 @@ uint8_t Adafruit_PN532::mifareclassic_WriteNDEFURI(uint8_t sectorNumber,
     @return  1 on success, 0 on error.
 */
 /**************************************************************************/
-uint8_t Adafruit_PN532::mifareultralight_ReadPage(uint8_t page,
+uint8_t PN532_mifareultralight_ReadPage(PN532_Handle * handle, uint8_t page,
                                                   uint8_t *buffer) {
   if (page >= 64) {
 #ifdef MIFAREDEBUG
-    PN532DEBUGPRINT.println(F("Page value out of range"));
+    DMSG_STR("Page value out of range");
 #endif
     return 0;
   }
 
 #ifdef MIFAREDEBUG
-  PN532DEBUGPRINT.print(F("Reading page "));
-  PN532DEBUGPRINT.println(page);
+  DMSG_STR("Reading page ");
+  DMSG_INT(page);
 #endif
 
   /* Prepare the command */
-  pn532_packetbuffer[0] = PN532_COMMAND_INDATAEXCHANGE;
-  pn532_packetbuffer[1] = 1;               /* Card number */
-  pn532_packetbuffer[2] = MIFARE_CMD_READ; /* Mifare Read command = 0x30 */
-  pn532_packetbuffer[3] = page; /* Page Number (0..63 in most cases) */
+  handle->pn532_packetbuffer[0] = PN532_COMMAND_INDATAEXCHANGE;
+  handle->pn532_packetbuffer[1] = 1;               /* Card number */
+  handle->pn532_packetbuffer[2] = MIFARE_CMD_READ; /* Mifare Read command = 0x30 */
+  handle->pn532_packetbuffer[3] = page; /* Page Number (0..63 in most cases) */
 
   /* Send the command */
-  if (!sendCommandCheckAck(pn532_packetbuffer, 4)) {
+  if (!PN532_sendCommandCheckAck(handle, handle->pn532_packetbuffer, 4, 1000)) {
 #ifdef MIFAREDEBUG
-    PN532DEBUGPRINT.println(F("Failed to receive ACK for write command"));
+    DMSG_STR("Failed to receive ACK for write command");
 #endif
     return 0;
   }
 
   /* Read the response packet */
-  readdata(pn532_packetbuffer, 26);
+  PN532_readdata(handle, handle->pn532_packetbuffer, 26);
 #ifdef MIFAREDEBUG
-  PN532DEBUGPRINT.println(F("Received: "));
-  Adafruit_PN532::PrintHexChar(pn532_packetbuffer, 26);
+  DMSG_STR("Received: "));
+  PN532_PrintHexChar(handle->pn532_packetbuffer, 26);
 #endif
 
   /* If byte 8 isn't 0x00 we probably have an error */
-  if (pn532_packetbuffer[7] == 0x00) {
+  if (handle->pn532_packetbuffer[7] == 0x00) {
     /* Copy the 4 data bytes to the output buffer         */
     /* Block content starts at byte 9 of a valid response */
     /* Note that the command actually reads 16 byte or 4  */
     /* pages at a time ... we simply discard the last 12  */
     /* bytes                                              */
-    memcpy(buffer, pn532_packetbuffer + 8, 4);
+    memcpy(buffer, handle->pn532_packetbuffer + 8, 4);
   } else {
 #ifdef MIFAREDEBUG
-    PN532DEBUGPRINT.println(F("Unexpected response reading block: "));
-    Adafruit_PN532::PrintHexChar(pn532_packetbuffer, 26);
+    DMSG_STR("Unexpected response reading block: ");
+    PN532_PrintHexChar(handle->pn532_packetbuffer, 26);
 #endif
     return 0;
   }
 
 /* Display data for debug if requested */
 #ifdef MIFAREDEBUG
-  PN532DEBUGPRINT.print(F("Page "));
+  DMSG_STR("Page ");
   PN532DEBUGPRINT.print(page);
-  PN532DEBUGPRINT.println(F(":"));
-  Adafruit_PN532::PrintHexChar(buffer, 4);
+  DMSG_STR(":");
+  PN532_PrintHexChar(buffer, 4);
 #endif
 
   // Return OK signal
@@ -1239,43 +1143,43 @@ uint8_t Adafruit_PN532::mifareultralight_ReadPage(uint8_t page,
     @returns 1 if everything executed properly, 0 for an error
 */
 /**************************************************************************/
-uint8_t Adafruit_PN532::mifareultralight_WritePage(uint8_t page,
+uint8_t PN532_mifareultralight_WritePage(PN532_Handle * handle, uint8_t page,
                                                    uint8_t *data) {
 
   if (page >= 64) {
 #ifdef MIFAREDEBUG
-    PN532DEBUGPRINT.println(F("Page value out of range"));
+    DMSG_STR("Page value out of range");
 #endif
     // Return Failed Signal
     return 0;
   }
 
 #ifdef MIFAREDEBUG
-  PN532DEBUGPRINT.print(F("Trying to write 4 byte page"));
-  PN532DEBUGPRINT.println(page);
+  DMSG_STR("Trying to write 4 byte page");
+  DMSG_INT(page);
 #endif
 
   /* Prepare the first command */
-  pn532_packetbuffer[0] = PN532_COMMAND_INDATAEXCHANGE;
-  pn532_packetbuffer[1] = 1; /* Card number */
-  pn532_packetbuffer[2] =
+  handle->pn532_packetbuffer[0] = PN532_COMMAND_INDATAEXCHANGE;
+  handle->pn532_packetbuffer[1] = 1; /* Card number */
+  handle->pn532_packetbuffer[2] =
       MIFARE_ULTRALIGHT_CMD_WRITE; /* Mifare Ultralight Write command = 0xA2 */
-  pn532_packetbuffer[3] = page;    /* Page Number (0..63 for most cases) */
-  memcpy(pn532_packetbuffer + 4, data, 4); /* Data Payload */
+  handle->pn532_packetbuffer[3] = page;    /* Page Number (0..63 for most cases) */
+  memcpy(handle->pn532_packetbuffer + 4, data, 4); /* Data Payload */
 
   /* Send the command */
-  if (!sendCommandCheckAck(pn532_packetbuffer, 8)) {
+  if (!PN532_sendCommandCheckAck(handle, handle->pn532_packetbuffer, 8, 1000)) {
 #ifdef MIFAREDEBUG
-    PN532DEBUGPRINT.println(F("Failed to receive ACK for write command"));
+    DMSG_STR("Failed to receive ACK for write command");
 #endif
 
     // Return Failed Signal
     return 0;
   }
-  delay(10);
+  HAL_Delay(2);
 
   /* Read the response packet */
-  readdata(pn532_packetbuffer, 26);
+  PN532_readdata(handle, handle->pn532_packetbuffer, 26);
 
   // Return OK Signal
   return 1;
@@ -1293,7 +1197,7 @@ uint8_t Adafruit_PN532::mifareultralight_WritePage(uint8_t page,
     @return  1 on success, 0 on error.
 */
 /**************************************************************************/
-uint8_t Adafruit_PN532::ntag2xx_ReadPage(uint8_t page, uint8_t *buffer) {
+uint8_t PN532_ntag2xx_ReadPage(PN532_Handle * handle, uint8_t page, uint8_t *buffer) {
   // TAG Type       PAGES   USER START    USER STOP
   // --------       -----   ----------    ---------
   // NTAG 203       42      4             39
@@ -1303,59 +1207,59 @@ uint8_t Adafruit_PN532::ntag2xx_ReadPage(uint8_t page, uint8_t *buffer) {
 
   if (page >= 231) {
 #ifdef MIFAREDEBUG
-    PN532DEBUGPRINT.println(F("Page value out of range"));
+    DMSG_STR("Page value out of range");
 #endif
     return 0;
   }
 
 #ifdef MIFAREDEBUG
-  PN532DEBUGPRINT.print(F("Reading page "));
+  DMSG_STR("Reading page ");
   PN532DEBUGPRINT.println(page);
 #endif
 
   /* Prepare the command */
-  pn532_packetbuffer[0] = PN532_COMMAND_INDATAEXCHANGE;
-  pn532_packetbuffer[1] = 1;               /* Card number */
-  pn532_packetbuffer[2] = MIFARE_CMD_READ; /* Mifare Read command = 0x30 */
-  pn532_packetbuffer[3] = page; /* Page Number (0..63 in most cases) */
+  handle->pn532_packetbuffer[0] = PN532_COMMAND_INDATAEXCHANGE;
+  handle->pn532_packetbuffer[1] = 1;               /* Card number */
+  handle->pn532_packetbuffer[2] = MIFARE_CMD_READ; /* Mifare Read command = 0x30 */
+  handle->pn532_packetbuffer[3] = page; /* Page Number (0..63 in most cases) */
 
   /* Send the command */
-  if (!sendCommandCheckAck(pn532_packetbuffer, 4)) {
+  if (!PN532_sendCommandCheckAck(handle, handle->pn532_packetbuffer, 4, 1000)) {
 #ifdef MIFAREDEBUG
-    PN532DEBUGPRINT.println(F("Failed to receive ACK for write command"));
+    DMSG_STR("Failed to receive ACK for write command");
 #endif
     return 0;
   }
 
   /* Read the response packet */
-  readdata(pn532_packetbuffer, 26);
+  PN532_readdata(handle, handle->pn532_packetbuffer, 26);
 #ifdef MIFAREDEBUG
-  PN532DEBUGPRINT.println(F("Received: "));
-  Adafruit_PN532::PrintHexChar(pn532_packetbuffer, 26);
+  DMSG_STR("Received: "));
+  PrintHexChar(handle->pn532_packetbuffer, 26);
 #endif
 
   /* If byte 8 isn't 0x00 we probably have an error */
-  if (pn532_packetbuffer[7] == 0x00) {
+  if (handle->pn532_packetbuffer[7] == 0x00) {
     /* Copy the 4 data bytes to the output buffer         */
     /* Block content starts at byte 9 of a valid response */
     /* Note that the command actually reads 16 byte or 4  */
     /* pages at a time ... we simply discard the last 12  */
     /* bytes                                              */
-    memcpy(buffer, pn532_packetbuffer + 8, 4);
+    memcpy(buffer, handle->pn532_packetbuffer + 8, 4);
   } else {
 #ifdef MIFAREDEBUG
-    PN532DEBUGPRINT.println(F("Unexpected response reading block: "));
-    Adafruit_PN532::PrintHexChar(pn532_packetbuffer, 26);
+    DMSG_STR("Unexpected response reading block: "));
+    PrintHexChar(handle->pn532_packetbuffer, 26);
 #endif
     return 0;
   }
 
 /* Display data for debug if requested */
 #ifdef MIFAREDEBUG
-  PN532DEBUGPRINT.print(F("Page "));
+  DMSG_STR("Page "));
   PN532DEBUGPRINT.print(page);
-  PN532DEBUGPRINT.println(F(":"));
-  Adafruit_PN532::PrintHexChar(buffer, 4);
+  DMSG_STR(":"));
+  PrintHexChar(buffer, 4);
 #endif
 
   // Return OK signal
@@ -1374,7 +1278,7 @@ uint8_t Adafruit_PN532::ntag2xx_ReadPage(uint8_t page, uint8_t *buffer) {
     @returns 1 if everything executed properly, 0 for an error
 */
 /**************************************************************************/
-uint8_t Adafruit_PN532::ntag2xx_WritePage(uint8_t page, uint8_t *data) {
+uint8_t PN532_ntag2xx_WritePage(PN532_Handle * handle, uint8_t page, uint8_t *data) {
   // TAG Type       PAGES   USER START    USER STOP
   // --------       -----   ----------    ---------
   // NTAG 203       42      4             39
@@ -1384,38 +1288,38 @@ uint8_t Adafruit_PN532::ntag2xx_WritePage(uint8_t page, uint8_t *data) {
 
   if ((page < 4) || (page > 225)) {
 #ifdef MIFAREDEBUG
-    PN532DEBUGPRINT.println(F("Page value out of range"));
+    DMSG_STR("Page value out of range"));
 #endif
     // Return Failed Signal
     return 0;
   }
 
 #ifdef MIFAREDEBUG
-  PN532DEBUGPRINT.print(F("Trying to write 4 byte page"));
+  DMSG_STR("Trying to write 4 byte page"));
   PN532DEBUGPRINT.println(page);
 #endif
 
   /* Prepare the first command */
-  pn532_packetbuffer[0] = PN532_COMMAND_INDATAEXCHANGE;
-  pn532_packetbuffer[1] = 1; /* Card number */
-  pn532_packetbuffer[2] =
+  handle->pn532_packetbuffer[0] = PN532_COMMAND_INDATAEXCHANGE;
+  handle->pn532_packetbuffer[1] = 1; /* Card number */
+  handle->pn532_packetbuffer[2] =
       MIFARE_ULTRALIGHT_CMD_WRITE; /* Mifare Ultralight Write command = 0xA2 */
-  pn532_packetbuffer[3] = page;    /* Page Number (0..63 for most cases) */
-  memcpy(pn532_packetbuffer + 4, data, 4); /* Data Payload */
+  handle->pn532_packetbuffer[3] = page;    /* Page Number (0..63 for most cases) */
+  memcpy(handle->pn532_packetbuffer + 4, data, 4); /* Data Payload */
 
   /* Send the command */
-  if (!sendCommandCheckAck(pn532_packetbuffer, 8)) {
+  if (!PN532_sendCommandCheckAck(handle, handle->pn532_packetbuffer, 8, 1000)) {
 #ifdef MIFAREDEBUG
-    PN532DEBUGPRINT.println(F("Failed to receive ACK for write command"));
+    DMSG_STR("Failed to receive ACK for write command"));
 #endif
 
     // Return Failed Signal
     return 0;
   }
-  delay(10);
+  HAL_Delay(2);
 
   /* Read the response packet */
-  readdata(pn532_packetbuffer, 26);
+  PN532_readdata(handle, handle->pn532_packetbuffer, 26);
 
   // Return OK Signal
   return 1;
@@ -1436,7 +1340,7 @@ uint8_t Adafruit_PN532::ntag2xx_WritePage(uint8_t page, uint8_t *data) {
     @returns 1 if everything executed properly, 0 for an error
 */
 /**************************************************************************/
-uint8_t Adafruit_PN532::ntag2xx_WriteNDEFURI(uint8_t uriIdentifier, char *url,
+uint8_t PN532_ntag2xx_WriteNDEFURI(PN532_Handle * handle, uint8_t uriIdentifier, char *url,
                                              uint8_t dataLen) {
   uint8_t pageBuffer[4] = {0, 0, 0, 0};
 
@@ -1473,13 +1377,13 @@ uint8_t Adafruit_PN532::ntag2xx_WriteNDEFURI(uint8_t uriIdentifier, char *url,
 
   // Write 12 byte header (three pages of data starting at page 4)
   memcpy(pageBuffer, pageHeader, 4);
-  if (!(ntag2xx_WritePage(4, pageBuffer)))
+  if (!(PN532_ntag2xx_WritePage(handle, 4, pageBuffer)))
     return 0;
   memcpy(pageBuffer, pageHeader + 4, 4);
-  if (!(ntag2xx_WritePage(5, pageBuffer)))
+  if (!(PN532_ntag2xx_WritePage(handle, 5, pageBuffer)))
     return 0;
   memcpy(pageBuffer, pageHeader + 8, 4);
-  if (!(ntag2xx_WritePage(6, pageBuffer)))
+  if (!(PN532_ntag2xx_WritePage(handle, 6, pageBuffer)))
     return 0;
 
   // Write URI (starting at page 7)
@@ -1490,25 +1394,25 @@ uint8_t Adafruit_PN532::ntag2xx_WriteNDEFURI(uint8_t uriIdentifier, char *url,
       memset(pageBuffer, 0, 4);
       memcpy(pageBuffer, urlcopy, len);
       pageBuffer[len] = 0xFE; // NDEF record footer
-      if (!(ntag2xx_WritePage(currentPage, pageBuffer)))
+      if (!(PN532_ntag2xx_WritePage(handle, currentPage, pageBuffer)))
         return 0;
       // DONE!
       return 1;
     } else if (len == 4) {
       memcpy(pageBuffer, urlcopy, len);
-      if (!(ntag2xx_WritePage(currentPage, pageBuffer)))
+      if (!(PN532_ntag2xx_WritePage(handle, currentPage, pageBuffer)))
         return 0;
       memset(pageBuffer, 0, 4);
       pageBuffer[0] = 0xFE; // NDEF record footer
       currentPage++;
-      if (!(ntag2xx_WritePage(currentPage, pageBuffer)))
+      if (!(PN532_ntag2xx_WritePage(handle, currentPage, pageBuffer)))
         return 0;
       // DONE!
       return 1;
     } else {
       // More than one page of data left
       memcpy(pageBuffer, urlcopy, 4);
-      if (!(ntag2xx_WritePage(currentPage, pageBuffer)))
+      if (!(PN532_ntag2xx_WritePage(handle, currentPage, pageBuffer)))
         return 0;
       currentPage++;
       urlcopy += 4;
@@ -1527,15 +1431,11 @@ uint8_t Adafruit_PN532::ntag2xx_WriteNDEFURI(uint8_t uriIdentifier, char *url,
     @brief  Tries to read the SPI or I2C ACK signal
 */
 /**************************************************************************/
-bool Adafruit_PN532::readack() {
+bool PN532_readack(PN532_Handle * handle) {
   uint8_t ackbuff[6];
 
-  if (spi_dev) {
-    uint8_t cmd = PN532_SPI_DATAREAD;
-    spi_dev->write_then_read(&cmd, 1, ackbuff, 6);
-  } else if (i2c_dev || ser_dev) {
-    readdata(ackbuff, 6);
-  }
+  uint8_t cmd = PN532_SPI_DATAREAD;
+  handle->interface.write_then_read(&cmd, 1, ackbuff, 6);
 
   return (0 == memcmp((char *)ackbuff, (char *)pn532ack, 6));
 }
@@ -1545,26 +1445,12 @@ bool Adafruit_PN532::readack() {
     @brief  Return true if the PN532 is ready with a response.
 */
 /**************************************************************************/
-bool Adafruit_PN532::isready() {
-  if (spi_dev) {
+bool PN532_isready(PN532_Handle * handle) {
     // SPI ready check via Status Request
     uint8_t cmd = PN532_SPI_STATREAD;
     uint8_t reply;
-    spi_dev->write_then_read(&cmd, 1, &reply, 1);
+    handle->interface.write_then_read(&cmd, 1, &reply, 1);
     return reply == PN532_SPI_READY;
-  } else if (i2c_dev) {
-    // I2C ready check via reading RDY byte
-    uint8_t rdy[1];
-    i2c_dev->read(rdy, 1);
-    return rdy[0] == PN532_I2C_READY;
-  } else if (ser_dev) {
-    // Serial ready check based on non-zero read buffer
-    return (ser_dev->available() != 0);
-  } else if (_irq != -1) {
-    uint8_t x = digitalRead(_irq);
-    return x == 0;
-  }
-  return false;
 }
 
 /**************************************************************************/
@@ -1574,19 +1460,19 @@ bool Adafruit_PN532::isready() {
     @param  timeout   Timeout before giving up
 */
 /**************************************************************************/
-bool Adafruit_PN532::waitready(uint16_t timeout) {
+bool PN532_waitready(PN532_Handle * handle, uint16_t timeout) {
   uint16_t timer = 0;
-  while (!isready()) {
+  while (!PN532_isready(handle)) {
     if (timeout != 0) {
-      timer += 10;
+      timer += 2;
       if (timer > timeout) {
 #ifdef PN532DEBUG
-        PN532DEBUGPRINT.println("TIMEOUT!");
+        DMSG_STR("TIMEOUT!");
 #endif
         return false;
       }
     }
-    delay(10);
+    HAL_Delay(2);
   }
   return true;
 }
@@ -1599,29 +1485,17 @@ bool Adafruit_PN532::waitready(uint16_t timeout) {
     @param  n         Number of bytes to be read
 */
 /**************************************************************************/
-void Adafruit_PN532::readdata(uint8_t *buff, uint8_t n) {
-  if (spi_dev) {
-    // SPI read
-    uint8_t cmd = PN532_SPI_DATAREAD;
-    spi_dev->write_then_read(&cmd, 1, buff, n);
-  } else if (i2c_dev) {
-    // I2C read
-    uint8_t rbuff[n + 1]; // +1 for leading RDY byte
-    i2c_dev->read(rbuff, n + 1);
-    for (uint8_t i = 0; i < n; i++) {
-      buff[i] = rbuff[i + 1];
-    }
-  } else if (ser_dev) {
-    // Serial read
-    ser_dev->readBytes(buff, n);
-  }
+void PN532_readdata(PN532_Handle * handle, uint8_t *buff, uint8_t n) {
+  // SPI read
+  uint8_t cmd = PN532_SPI_DATAREAD;
+  handle->interface.write_then_read(&cmd, 1, buff, n);
 #ifdef PN532DEBUG
-  PN532DEBUGPRINT.print(F("Reading: "));
+  DMSG_STR("Reading: ");
   for (uint8_t i = 0; i < n; i++) {
-    PN532DEBUGPRINT.print(F(" 0x"));
-    PN532DEBUGPRINT.print(buff[i], HEX);
+    DMSG_STR(" 0x");
+    DMSG_HEX(buff[i]);
   }
-  PN532DEBUGPRINT.println();
+  DMSG_STR("\r\n");
 #endif
 }
 
@@ -1635,8 +1509,8 @@ void Adafruit_PN532::readdata(uint8_t *buff, uint8_t n) {
              -setDataTarget
 */
 /**************************************************************************/
-uint8_t Adafruit_PN532::AsTarget() {
-  pn532_packetbuffer[0] = 0x8C;
+uint8_t PN532_AsTarget(PN532_Handle * handle) {
+  handle->pn532_packetbuffer[0] = 0x8C;
   uint8_t target[] = {
       0x8C,             // INIT AS TARGET
       0x00,             // MODE -> BITFIELD
@@ -1652,14 +1526,14 @@ uint8_t Adafruit_PN532::AsTarget() {
       0x0d, 0x52, 0x46, 0x49, 0x44, 0x49, 0x4f,
       0x74, 0x20, 0x50, 0x4e, 0x35, 0x33, 0x32 // HISTORICAL BYTES
   };
-  if (!sendCommandCheckAck(target, sizeof(target)))
-    return false;
+  if (!PN532_sendCommandCheckAck(handle, target, sizeof(target), 1000))
+    return 0;
 
   // read data packet
-  readdata(pn532_packetbuffer, 8);
+  PN532_readdata(handle, handle->pn532_packetbuffer, 8);
 
   int offset = 6;
-  return (pn532_packetbuffer[offset] == 0x15);
+  return (handle->pn532_packetbuffer[offset] == 0x15);
 }
 /**************************************************************************/
 /*!
@@ -1670,17 +1544,17 @@ uint8_t Adafruit_PN532::AsTarget() {
     @return  true on success, false otherwise.
 */
 /**************************************************************************/
-uint8_t Adafruit_PN532::getDataTarget(uint8_t *cmd, uint8_t *cmdlen) {
+uint8_t PN532_getDataTarget(PN532_Handle * handle, uint8_t *cmd, uint8_t *cmdlen) {
   uint8_t length;
-  pn532_packetbuffer[0] = 0x86;
-  if (!sendCommandCheckAck(pn532_packetbuffer, 1, 1000)) {
-    PN532DEBUGPRINT.println(F("Error en ack"));
-    return false;
+  handle->pn532_packetbuffer[0] = 0x86;
+  if (!PN532_sendCommandCheckAck(handle, handle->pn532_packetbuffer, 1, 1000)) {
+    DMSG_STR("Error en ack");
+    return 0;
   }
 
   // read data packet
-  readdata(pn532_packetbuffer, 64);
-  length = pn532_packetbuffer[3] - 3;
+  PN532_readdata(handle, handle->pn532_packetbuffer, 64);
+  length = handle->pn532_packetbuffer[3] - 3;
 
   // if (length > *responseLength) {// Bug, should avoid it in the reading
   // target data
@@ -1688,10 +1562,10 @@ uint8_t Adafruit_PN532::getDataTarget(uint8_t *cmd, uint8_t *cmdlen) {
   //}
 
   for (int i = 0; i < length; ++i) {
-    cmd[i] = pn532_packetbuffer[8 + i];
+    cmd[i] = handle->pn532_packetbuffer[8 + i];
   }
   *cmdlen = length;
-  return true;
+  return 1;
 }
 
 /**************************************************************************/
@@ -1703,24 +1577,24 @@ uint8_t Adafruit_PN532::getDataTarget(uint8_t *cmd, uint8_t *cmdlen) {
     @return  true on success, false otherwise.
 */
 /**************************************************************************/
-uint8_t Adafruit_PN532::setDataTarget(uint8_t *cmd, uint8_t cmdlen) {
+uint8_t PN532_setDataTarget(PN532_Handle * handle, uint8_t *cmd, uint8_t cmdlen) {
   uint8_t length;
   // cmd1[0] = 0x8E; Must!
 
-  if (!sendCommandCheckAck(cmd, cmdlen))
+  if (!PN532_sendCommandCheckAck(handle, cmd, cmdlen , 1000))
     return false;
 
   // read data packet
-  readdata(pn532_packetbuffer, 8);
-  length = pn532_packetbuffer[3] - 3;
+  PN532_readdata(handle, handle->pn532_packetbuffer, 8);
+  length = handle->pn532_packetbuffer[3] - 3;
   for (int i = 0; i < length; ++i) {
-    cmd[i] = pn532_packetbuffer[8 + i];
+    cmd[i] = handle->pn532_packetbuffer[8 + i];
   }
   // cmdl = 0
   cmdlen = length;
 
   int offset = 6;
-  return (pn532_packetbuffer[offset] == 0x15);
+  return (handle->pn532_packetbuffer[offset] == 0x15);
 }
 
 /**************************************************************************/
@@ -1732,89 +1606,53 @@ uint8_t Adafruit_PN532::setDataTarget(uint8_t *cmd, uint8_t cmdlen) {
     @param  cmdlen    Command length in bytes
 */
 /**************************************************************************/
-void Adafruit_PN532::writecommand(uint8_t *cmd, uint8_t cmdlen) {
-  if (spi_dev) {
-    // SPI command write.
-    uint8_t checksum;
-    uint8_t packet[9 + cmdlen];
-    uint8_t *p = packet;
-    cmdlen++;
+void PN532_writecommand(PN532_Handle * handle, uint8_t *cmd, uint8_t cmdlen) {
+  // SPI command write.
+  uint8_t checksum;
+  uint8_t packet[9 + cmdlen];
+  uint8_t *p = packet;
+  cmdlen++;
 
-    p[0] = PN532_SPI_DATAWRITE;
+  p[0] = PN532_SPI_DATAWRITE;
+  p++;
+
+  p[0] = PN532_PREAMBLE;
+  p++;
+  p[0] = PN532_STARTCODE1;
+  p++;
+  p[0] = PN532_STARTCODE2;
+  p++;
+  checksum = PN532_PREAMBLE + PN532_STARTCODE1 + PN532_STARTCODE2;
+
+  p[0] = cmdlen;
+  p++;
+  p[0] = ~cmdlen + 1;
+  p++;
+
+  p[0] = PN532_HOSTTOPN532;
+  p++;
+  checksum += PN532_HOSTTOPN532;
+
+  for (uint8_t i = 0; i < cmdlen - 1; i++) {
+    p[0] = cmd[i];
     p++;
-
-    p[0] = PN532_PREAMBLE;
-    p++;
-    p[0] = PN532_STARTCODE1;
-    p++;
-    p[0] = PN532_STARTCODE2;
-    p++;
-    checksum = PN532_PREAMBLE + PN532_STARTCODE1 + PN532_STARTCODE2;
-
-    p[0] = cmdlen;
-    p++;
-    p[0] = ~cmdlen + 1;
-    p++;
-
-    p[0] = PN532_HOSTTOPN532;
-    p++;
-    checksum += PN532_HOSTTOPN532;
-
-    for (uint8_t i = 0; i < cmdlen - 1; i++) {
-      p[0] = cmd[i];
-      p++;
-      checksum += cmd[i];
-    }
-
-    p[0] = ~checksum;
-    p++;
-    p[0] = PN532_POSTAMBLE;
-    p++;
-
-#ifdef PN532DEBUG
-    Serial.print("Sending : ");
-    for (int i = 1; i < 8 + cmdlen; i++) {
-      Serial.print("0x");
-      Serial.print(packet[i], HEX);
-      Serial.print(", ");
-    }
-    Serial.println();
-#endif
-
-    spi_dev->write(packet, 8 + cmdlen);
-  } else if (i2c_dev || ser_dev) {
-    // I2C or Serial command write.
-    uint8_t packet[8 + cmdlen];
-    uint8_t LEN = cmdlen + 1;
-
-    packet[0] = PN532_PREAMBLE;
-    packet[1] = PN532_STARTCODE1;
-    packet[2] = PN532_STARTCODE2;
-    packet[3] = LEN;
-    packet[4] = ~LEN + 1;
-    packet[5] = PN532_HOSTTOPN532;
-    uint8_t sum = 0;
-    for (uint8_t i = 0; i < cmdlen; i++) {
-      packet[6 + i] = cmd[i];
-      sum += cmd[i];
-    }
-    packet[6 + cmdlen] = ~(PN532_HOSTTOPN532 + sum) + 1;
-    packet[7 + cmdlen] = PN532_POSTAMBLE;
-
-#ifdef PN532DEBUG
-    Serial.print("Sending : ");
-    for (int i = 1; i < 8 + cmdlen; i++) {
-      Serial.print("0x");
-      Serial.print(packet[i], HEX);
-      Serial.print(", ");
-    }
-    Serial.println();
-#endif
-
-    if (i2c_dev) {
-      i2c_dev->write(packet, 8 + cmdlen);
-    } else {
-      ser_dev->write(packet, 8 + cmdlen);
-    }
+    checksum += cmd[i];
   }
+
+  p[0] = ~checksum;
+  p++;
+  p[0] = PN532_POSTAMBLE;
+  p++;
+
+#ifdef PN532DEBUG
+  DMSG_STR("Sending : ");
+  for (int i = 1; i < 8 + cmdlen; i++) {
+    DMSG_STR("0x");
+    DMSG_HEX(packet[i]);
+    DMSG_STR(", ");
+  }
+  DMSG_STR("\r\n");
+#endif
+
+  handle->interface.write(packet, 8 + cmdlen);
 }
