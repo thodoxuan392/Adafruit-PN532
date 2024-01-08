@@ -1472,7 +1472,7 @@ bool PN532_waitready(PN532_Handle * handle, uint16_t timeout) {
         return false;
       }
     }
-    HAL_Delay(2);
+    HAL_Delay(1);
   }
   return true;
 }
