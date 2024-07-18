@@ -153,7 +153,7 @@ typedef struct {
 bool PN532_begin(PN532_Handle * handle);
 
 void PN532_reset(PN532_Handle * handle);
-void PN532_wakeup(PN532_Handle * handle);
+bool PN532_wakeup(PN532_Handle * handle);
 
 // Generic PN532 functions
 bool PN532_SAMConfig(PN532_Handle * handle);

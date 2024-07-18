@@ -102,8 +102,11 @@ static bool PN532_readack(PN532_Handle* handle);
 */
 /**************************************************************************/
 bool PN532_begin(PN532_Handle * handle) {
-  PN532_reset(handle); // HW reset - put in known state
-  PN532_wakeup(handle); // hey! wakeup!
+  for (uint8_t var = 0; var < 100; ++var) {
+	  if(PN532_wakeup(handle)){
+		  break;
+	  }
+  }
   return true;
 }
 
@@ -113,6 +116,10 @@ bool PN532_begin(PN532_Handle * handle) {
 */
 /**************************************************************************/
 void PN532_reset(PN532_Handle * handle) {
+	handle->interface.reset(false);
+	HAL_Delay(1000);
+	handle->interface.reset(true);
+	HAL_Delay(1000);
 }
 
 /**************************************************************************/
@@ -120,9 +127,14 @@ void PN532_reset(PN532_Handle * handle) {
     @brief  Wakeup from LowVbat mode into Normal Mode.
 */
 /**************************************************************************/
-void PN532_wakeup(PN532_Handle * handle) {
+bool PN532_wakeup(PN532_Handle * handle) {
   // need to config SAM to stay in Normal Mode
-  PN532_SAMConfig(handle);
+	uint8_t w[5] = { 0x55, 0x55,0x00, 0x00, 0x00};
+	handle->interface.write(w, 5);
+//	uint8_t w[3] = { 0x55, 0x00, 0x00};
+//	handle->interface.write(w, 3);
+	HAL_Delay(20);
+	return PN532_SAMConfig(handle);
 }
 
 /**************************************************************************/
@@ -262,9 +274,9 @@ bool PN532_sendCommandCheckAck(PN532_Handle * handle, uint8_t *cmd, uint8_t cmdl
   }
 
   // Wait for chip to say its ready!
-  if (!PN532_waitready(handle, timeout)) {
-    return false;
-  }
+    if (!PN532_waitready(handle,timeout)) {
+      return false;
+    }
 
   return true; // ack'd command
 }
@@ -1434,8 +1446,7 @@ uint8_t PN532_ntag2xx_WriteNDEFURI(PN532_Handle * handle, uint8_t uriIdentifier,
 bool PN532_readack(PN532_Handle * handle) {
   uint8_t ackbuff[6];
 
-  uint8_t cmd = PN532_SPI_DATAREAD;
-  handle->interface.write_then_read(&cmd, 1, ackbuff, 6);
+  PN532_readdata(handle, ackbuff, 6);
 
   return (0 == memcmp((char *)ackbuff, (char *)pn532ack, 6));
 }
@@ -1446,11 +1457,7 @@ bool PN532_readack(PN532_Handle * handle) {
 */
 /**************************************************************************/
 bool PN532_isready(PN532_Handle * handle) {
-    // SPI ready check via Status Request
-    uint8_t cmd = PN532_SPI_STATREAD;
-    uint8_t reply;
-    handle->interface.write_then_read(&cmd, 1, &reply, 1);
-    return reply == PN532_SPI_READY;
+    return handle->interface.isAvailable();
 }
 
 /**************************************************************************/
@@ -1487,8 +1494,7 @@ bool PN532_waitready(PN532_Handle * handle, uint16_t timeout) {
 /**************************************************************************/
 void PN532_readdata(PN532_Handle * handle, uint8_t *buff, uint8_t n) {
   // SPI read
-  uint8_t cmd = PN532_SPI_DATAREAD;
-  handle->interface.write_then_read(&cmd, 1, buff, n);
+  handle->interface.read(buff, n, 20);
 #ifdef PN532DEBUG
   DMSG_STR("Reading: ");
   for (uint8_t i = 0; i < n; i++) {
@@ -1607,42 +1613,26 @@ uint8_t PN532_setDataTarget(PN532_Handle * handle, uint8_t *cmd, uint8_t cmdlen)
 */
 /**************************************************************************/
 void PN532_writecommand(PN532_Handle * handle, uint8_t *cmd, uint8_t cmdlen) {
-  // SPI command write.
-  uint8_t checksum;
-  uint8_t packet[9 + cmdlen];
-  uint8_t *p = packet;
-  cmdlen++;
 
-  p[0] = PN532_SPI_DATAWRITE;
-  p++;
+	// Cleanup
+	handle->interface.cleanUp();
 
-  p[0] = PN532_PREAMBLE;
-  p++;
-  p[0] = PN532_STARTCODE1;
-  p++;
-  p[0] = PN532_STARTCODE2;
-  p++;
-  checksum = PN532_PREAMBLE + PN532_STARTCODE1 + PN532_STARTCODE2;
+	uint8_t packet[8 + cmdlen];
+	uint8_t LEN = cmdlen + 1;
 
-  p[0] = cmdlen;
-  p++;
-  p[0] = ~cmdlen + 1;
-  p++;
-
-  p[0] = PN532_HOSTTOPN532;
-  p++;
-  checksum += PN532_HOSTTOPN532;
-
-  for (uint8_t i = 0; i < cmdlen - 1; i++) {
-    p[0] = cmd[i];
-    p++;
-    checksum += cmd[i];
-  }
-
-  p[0] = ~checksum;
-  p++;
-  p[0] = PN532_POSTAMBLE;
-  p++;
+	packet[0] = PN532_PREAMBLE;
+	packet[1] = PN532_STARTCODE1;
+	packet[2] = PN532_STARTCODE2;
+	packet[3] = LEN;
+	packet[4] = ~LEN + 1;
+	packet[5] = PN532_HOSTTOPN532;
+	uint8_t sum = 0;
+	for (uint8_t i = 0; i < cmdlen; i++) {
+	  packet[6 + i] = cmd[i];
+	  sum += cmd[i];
+	}
+	packet[6 + cmdlen] = ~(PN532_HOSTTOPN532 + sum) + 1;
+	packet[7 + cmdlen] = PN532_POSTAMBLE;
 
 #ifdef PN532DEBUG
   DMSG_STR("Sending : ");

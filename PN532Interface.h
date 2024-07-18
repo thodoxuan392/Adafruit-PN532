@@ -26,7 +26,10 @@
                                       b = (b & 0xAA) >> 1 | (b & 0x55) << 1
 typedef struct {
     void (*write)(const uint8_t *data, const uint32_t data_len);
-    void (*write_then_read)(uint8_t* tx_buf, uint32_t tx_len, uint8_t *rx_buf, uint32_t rx_len);
+    void (*read)(uint8_t* tx_buf, uint32_t tx_len, uint32_t timeout);			// Default 100ms timeout
+    bool (*isAvailable)(void);
+    void (*cleanUp)(void);
+    void (*reset)(bool enable);
 }PN532Interface;
 
 #endif
